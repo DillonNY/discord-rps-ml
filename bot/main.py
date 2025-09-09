@@ -3,6 +3,9 @@ from discord.ext import commands
 import random
 from collections import Counter, deque
 import numpy as np
+import os
+from pathlib import Path
+from dotenv import load_dotenv
 
 class RPSGame:
     """Core Rock Paper Scissors game logic with ML prediction"""
@@ -541,8 +544,24 @@ async def on_reaction_add(reaction, user):
             # Send result
             embed = create_result_embed(user_choice, comp_choice, outcome, ml_used, confidence)
             await reaction.message.channel.send(f"{user.mention}", embed=embed)
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
 
 # Run the bot
-if __name__ == '__main__':
-    # Replace with your bot token
-    bot.run('MTQwNzM5NDI2NDEyMzU3MjM2NQ.GPnPXZ.oCGJZjMWbHPJbvc9NvLVaf9gNc9ZzdpY5nMTek')
+if __name__ == "__main__":
+    token = os.getenv("DISCORD_BOT_TOKEN")
+    token = token.strip() if token else None  # strip hidden whitespace/newlines
+
+    # quick sanity check w/o printing the token
+    if not token:
+        print("❌ DISCORD_BOT_TOKEN is missing. Check your .env location/content.")
+        raise SystemExit(1)
+    if " " in token or token.startswith('"') or token.endswith('"'):
+        print("❌ Token has quotes/spaces. Remove them in .env.")
+        raise SystemExit(1)
+
+    try:
+        bot.run(token)   # do NOT prefix with "Bot "
+    except Exception as e:
+        print(f"❌ Bot failed to start: {e}")
+        print("If this says 'Improper token', regenerate the Bot Token and paste it again.")

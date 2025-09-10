@@ -1,3 +1,4 @@
+
 # Python
 __pycache__/
 *.pyc
@@ -17,3 +18,8 @@ Thumbs.db
 data/*.db
 data/*.sqlite
 data/models/
+data/*.csv
+*.log
+
+# Remove editor workspace files
+bot/Code.code-workspace

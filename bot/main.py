@@ -1,300 +1,467 @@
 import discord
 from discord.ext import commands
 import random
+import asyncio
+import time
+import os
 from collections import Counter, deque
 import numpy as np
-import os
-from pathlib import Path
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+import warnings
 from dotenv import load_dotenv
+warnings.filterwarnings('ignore')
 
-class RPSGame:
-    """Core Rock Paper Scissors game logic with ML prediction"""
+class FeatureEngineer:
+    """Extract features from move sequences and timing"""
     
-    RPS_CONVERSION = {"rock": 0, "paper": 1, "scissors": 2}
-    REVERSE_RPS = {v: k for k, v in RPS_CONVERSION.items()}
-    MOVE_EMOJIS = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
-    
-    def __init__(self):
-        self.result_text = {1: "You win!", 0: "It's a draw!", -1: "You lose!"}
-    
-    def get_user_choice(self, choice):
-        """Convert string choice to integer"""
-        return self.RPS_CONVERSION.get(choice.lower(), None)
-    
-    def get_computer_choice(self, predicted_user_move=None):
-        """Generate computer choice - random or counter-predicted move"""
-        if predicted_user_move is not None:
-            # Counter the predicted move (rock beats scissors, etc.)
-            counter_move = (predicted_user_move + 1) % 3
-            return counter_move
-        return random.choice(list(self.RPS_CONVERSION.values()))
-    
-    def determine_winner(self, user, comp):
-        """Determine winner between user and computer"""
-        if user == comp:
-            return 0   # draw
-        elif (user - comp) % 3 == 1:
-            return 1   # user wins
-        else:
-            return -1  # user loses
-    
-    def get_move_name(self, move_int):
-        """Convert integer move back to string"""
-        return self.REVERSE_RPS[move_int]
-    
-    def get_move_emoji(self, move_int):
-        """Get emoji for a move"""
-        move_name = self.get_move_name(move_int)
-        return self.MOVE_EMOJIS[move_name]
-
-class SimpleMLPredictor:
-    """Simple pattern-based move predictor"""
-    
-    def __init__(self, pattern_length=3):
-        self.pattern_length = pattern_length
-        self.pattern_counts = {}
-    
-    def update_patterns(self, moves_history):
-        """Update pattern database with new move history"""
-        if len(moves_history) < self.pattern_length + 1:
-            return
-        
-        # Extract patterns from history
-        for i in range(len(moves_history) - self.pattern_length):
-            pattern = tuple(moves_history[i:i + self.pattern_length])
-            next_move = moves_history[i + self.pattern_length]
-            
-            if pattern not in self.pattern_counts:
-                self.pattern_counts[pattern] = Counter()
-            self.pattern_counts[pattern][next_move] += 1
-    
-    def predict_next_move(self, recent_moves):
-        """Predict next move based on recent pattern"""
-        if len(recent_moves) < self.pattern_length:
+    def extract_features(self, moves_history, timing_history=None):
+        """Extract ML features from player history"""
+        if len(moves_history) < 5:
             return None
         
-        current_pattern = tuple(recent_moves[-self.pattern_length:])
+        moves = list(moves_history)
+        features = []
         
-        if current_pattern in self.pattern_counts:
-            # Get most common next move for this pattern
-            most_common = self.pattern_counts[current_pattern].most_common(1)
-            if most_common:
-                return most_common[0][0]
+        # Last 3 moves
+        features.extend(moves[-3:])
         
-        return None
+        # Move frequencies
+        move_counts = Counter(moves)
+        total = len(moves)
+        for move in [0, 1, 2]:
+            features.append(move_counts.get(move, 0) / total)
+        
+        # Current streak length
+        current_streak = 1
+        for i in range(len(moves) - 2, -1, -1):
+            if moves[i] == moves[-1]:
+                current_streak += 1
+            else:
+                break
+        features.append(min(current_streak, 10))  # Cap at 10
+        
+        # Pattern repetition score
+        if len(moves) >= 4:
+            pairs = [(moves[i], moves[i+1]) for i in range(len(moves)-1)]
+            pair_counts = Counter(pairs)
+            most_common_freq = pair_counts.most_common(1)[0][1] / len(pairs) if pairs else 0
+            features.append(most_common_freq)
+        else:
+            features.append(0)
+        
+        # Alternation score
+        if len(moves) > 1:
+            alternations = sum(1 for i in range(1, len(moves)) if moves[i] != moves[i-1])
+            alt_score = alternations / (len(moves) - 1)
+        else:
+            alt_score = 0
+        features.append(alt_score)
+        
+        # Recent vs old behavior
+        if len(moves) >= 10:
+            recent = moves[-5:]
+            old = moves[-10:-5]
+            recent_counts = Counter(recent)
+            old_counts = Counter(old)
+            
+            # Calculate behavior shift
+            behavior_shift = 0
+            for move in [0, 1, 2]:
+                recent_freq = recent_counts.get(move, 0) / 5
+                old_freq = old_counts.get(move, 0) / 5
+                behavior_shift += abs(recent_freq - old_freq)
+            features.append(behavior_shift)
+        else:
+            features.append(0)
+        
+        return np.array(features).reshape(1, -1)
+
+class MLPredictor:
+    """ML-based move predictor"""
     
-    def get_confidence(self, recent_moves):
-        """Get confidence in prediction (0-100%)"""
-        if len(recent_moves) < self.pattern_length:
-            return 0
+    def __init__(self):
+        self.feature_engineer = FeatureEngineer()
+        self.model = RandomForestClassifier(n_estimators=50, max_depth=8, random_state=42)
+        self.is_trained = False
+        self.training_accuracy = 0.0
+        self.min_samples = 10
+    
+    def prepare_training_data(self, moves_history):
+        """Prepare training data from move history"""
+        if len(moves_history) < self.min_samples:
+            return None, None
         
-        current_pattern = tuple(recent_moves[-self.pattern_length:])
-        if current_pattern not in self.pattern_counts:
-            return 0
+        moves = list(moves_history)
+        X, y = [], []
         
-        pattern_data = self.pattern_counts[current_pattern]
-        total_occurrences = sum(pattern_data.values())
-        max_count = max(pattern_data.values())
+        # Create training samples
+        for i in range(5, len(moves)):
+            features = self.feature_engineer.extract_features(moves[:i])
+            if features is not None:
+                X.append(features[0])  # Extract from reshape
+                y.append(moves[i])
         
-        return (max_count / total_occurrences) * 100 if total_occurrences > 0 else 0
+        return np.array(X) if X else None, np.array(y) if y else None
+    
+    def train(self, player):
+        """Train the model on player data"""
+        X, y = self.prepare_training_data(player.moves_history)
+        
+        if X is None or len(X) < 5:
+            return False
+        
+        try:
+            self.model.fit(X, y)
+            
+            # Calculate training accuracy
+            predictions = self.model.predict(X)
+            self.training_accuracy = accuracy_score(y, predictions)
+            self.is_trained = True
+            return True
+        except Exception as e:
+            print(f"Training error: {e}")
+            return False
+    
+    def predict(self, player):
+        """Predict next move with confidence"""
+        if not self.is_trained:
+            return None, 0
+        
+        features = self.feature_engineer.extract_features(list(player.moves_history))
+        if features is None:
+            return None, 0
+        
+        try:
+            # Get prediction
+            prediction = self.model.predict(features)[0]
+            
+            # Get confidence from probability
+            probabilities = self.model.predict_proba(features)[0]
+            confidence = max(probabilities) * 100
+            
+            return int(prediction), confidence
+        except Exception as e:
+            print(f"Prediction error: {e}")
+            return None, 0
 
 class Player:
-    """Represents a Discord user's RPS data and statistics"""
+    """Enhanced player with comprehensive tracking"""
     
     def __init__(self, user_id):
         self.user_id = user_id
         self.wins = 0
         self.losses = 0
         self.draws = 0
-        self.moves_history = deque(maxlen=100)  # Keep last 100 moves
-        self.ml_wins = 0  # Wins when ML was used
-        self.ml_games = 0  # Games where ML was used
+        self.moves_history = deque(maxlen=150)
+        self.timing_history = deque(maxlen=150)
+        self.ml_wins = 0
+        self.ml_games = 0
+        self.ml_correct_predictions = 0
+        self.last_move_time = None
+        self.win_streak = 0
+        self.max_win_streak = 0
+        self.challenge_wins = 0
+        self.challenge_losses = 0
+        self.prediction_dodges = 0
     
     @property
     def games_played(self):
-        """Total games played"""
         return self.wins + self.losses + self.draws
     
     @property
     def win_rate(self):
-        """Calculate win rate as percentage"""
         if self.games_played == 0:
             return 0.0
         return (self.wins / self.games_played) * 100
     
     @property
-    def ml_performance(self):
-        """How well ML performs against this player"""
+    def ml_resistance(self):
+        """How well player resists ML predictions"""
         if self.ml_games == 0:
             return 0.0
-        return ((self.ml_games - self.ml_wins) / self.ml_games) * 100  # Bot's win rate
+        return (self.ml_wins / self.ml_games) * 100
     
-    def add_game_result(self, user_move, outcome, ml_used=False):
-        """Record a game result"""
+    def add_game_result(self, user_move, outcome, ml_used=False, prediction_correct=False):
+        """Record comprehensive game result"""
+        current_time = time.time()
+        
+        # Add move and timing
         self.moves_history.append(user_move)
+        if self.last_move_time:
+            time_diff = min(current_time - self.last_move_time, 60)  # Cap at 60s
+            self.timing_history.append(time_diff)
+        self.last_move_time = current_time
         
-        if outcome == 1:
+        # Update basic stats
+        if outcome == 1:  # Win
             self.wins += 1
-        elif outcome == -1:
+            self.win_streak += 1
+            self.max_win_streak = max(self.max_win_streak, self.win_streak)
+        elif outcome == -1:  # Loss
             self.losses += 1
-        else:
+            self.win_streak = 0
+        else:  # Draw
             self.draws += 1
+            self.win_streak = 0
         
+        # ML tracking
         if ml_used:
             self.ml_games += 1
-            if outcome == 1:  # User won
+            if outcome == 1:
                 self.ml_wins += 1
+            if prediction_correct:
+                self.ml_correct_predictions += 1
+            else:
+                self.prediction_dodges += 1
     
     def get_move_preferences(self):
-        """Get player's move frequency as percentages"""
+        """Get move distribution"""
         if not self.moves_history:
-            return {}
+            return {"rock": 33.3, "paper": 33.3, "scissors": 33.3}
         
         move_counts = Counter(self.moves_history)
         total = len(self.moves_history)
+        move_names = ["rock", "paper", "scissors"]
         
-        preferences = {}
-        for move_int in [0, 1, 2]:  # rock, paper, scissors
-            count = move_counts.get(move_int, 0)
-            move_name = RPSGame.REVERSE_RPS[move_int]
-            preferences[move_name] = (count / total) * 100
-        
-        return preferences
+        return {move_names[i]: (move_counts.get(i, 0) / total) * 100 for i in range(3)}
 
-class PlayerManager:
-    """Manages all player data and statistics"""
+class ChallengeSystem:
+    """Handle player vs player challenges"""
     
     def __init__(self):
-        self.players = {}
-        self.predictor = SimpleMLPredictor()
+        self.challenges = {}  # channel_id -> challenge_data
     
-    def get_player(self, user_id):
-        """Get or create a player"""
-        if user_id not in self.players:
-            self.players[user_id] = Player(user_id)
-        return self.players[user_id]
+    def create_challenge(self, challenger_id, challenged_id, channel_id):
+        """Create new challenge"""
+        self.challenges[channel_id] = {
+            'challenger': challenger_id,
+            'challenged': challenged_id,
+            'status': 'pending',
+            'moves': {},
+            'round': 1,
+            'scores': {challenger_id: 0, challenged_id: 0},
+            'timestamp': time.time()
+        }
+        return True
     
-    def get_leaderboard(self, min_games=5):
-        """Get leaderboard sorted by win rate"""
-        qualified = {uid: player for uid, player in self.players.items() 
-                    if player.games_played >= min_games}
-        
-        return sorted(qualified.items(), key=lambda x: x[1].win_rate, reverse=True)
+    def get_challenge(self, channel_id):
+        return self.challenges.get(channel_id)
     
-    def reset_player(self, user_id):
-        """Reset a player's statistics"""
-        if user_id in self.players:
-            del self.players[user_id]
+    def accept_challenge(self, channel_id, user_id):
+        challenge = self.challenges.get(channel_id)
+        if challenge and challenge['challenged'] == user_id and challenge['status'] == 'pending':
+            challenge['status'] = 'active'
             return True
         return False
     
-    def should_use_ml(self, player):
-        """Decide whether to use ML prediction (after 5+ games)"""
-        return len(player.moves_history) >= 5
+    def submit_move(self, channel_id, user_id, move):
+        challenge = self.challenges.get(channel_id)
+        if not challenge or challenge['status'] != 'active':
+            return None
+        
+        # Record move
+        challenge['moves'][user_id] = move
+        
+        # Check if both players submitted
+        if len(challenge['moves']) == 2:
+            return self._resolve_round(channel_id)
+        
+        return 'waiting'
+    
+    def _resolve_round(self, channel_id):
+        challenge = self.challenges[channel_id]
+        
+        challenger_move = challenge['moves'][challenge['challenger']]
+        challenged_move = challenge['moves'][challenge['challenged']]
+        
+        # Determine winner - FIXED LOGIC
+        if challenger_move == challenged_move:
+            winner = 0  # Draw
+        elif (challenger_move == 0 and challenged_move == 2) or \
+             (challenger_move == 1 and challenged_move == 0) or \
+             (challenger_move == 2 and challenged_move == 1):
+            winner = 1  # Challenger wins
+            challenge['scores'][challenge['challenger']] += 1
+        else:
+            winner = -1  # Challenged wins
+            challenge['scores'][challenge['challenged']] += 1
+        
+        result = {
+            'round': challenge['round'],
+            'challenger': challenge['challenger'],
+            'challenged': challenge['challenged'],
+            'challenger_move': challenger_move,
+            'challenged_move': challenged_move,
+            'winner': winner,
+            'scores': challenge['scores'].copy()
+        }
+        
+        # Reset for next round
+        challenge['moves'] = {}
+        challenge['round'] += 1
+        
+        # Check if challenge complete
+        if max(challenge['scores'].values()) >= 2:  # First to 2 wins
+            result['completed'] = True
+            if challenge['scores'][challenge['challenger']] > challenge['scores'][challenge['challenged']]:
+                result['final_winner'] = challenge['challenger']
+            else:
+                result['final_winner'] = challenge['challenged']
+        
+        return result
 
-# Helper function for creating result embeds
-def create_result_embed(user_choice, comp_choice, outcome, ml_used=False, confidence=0):
-    """Create a formatted result embed"""
-    if outcome == 1:
-        result_text = "🎉 You win!"
-        color = 0x00ff00  # Green
-    elif outcome == -1:
-        result_text = "😔 You lose!"
-        color = 0xff0000  # Red
-    else:
-        result_text = "🤝 It's a draw!"
-        color = 0xffff00  # Yellow
+class RPSGame:
+    def __init__(self):
+        self.moves = ["rock", "paper", "scissors"]
+        self.emojis = ["🪨", "📄", "✂️"]
+        self.conversion = {"rock": 0, "paper": 1, "scissors": 2}
     
-    embed = discord.Embed(title="🎮 RPS Result", color=color)
+    def get_user_choice(self, choice):
+        return self.conversion.get(choice.lower())
     
-    user_move_name = game.get_move_name(user_choice)
-    comp_move_name = game.get_move_name(comp_choice)
-    user_emoji = game.get_move_emoji(user_choice)
-    comp_emoji = game.get_move_emoji(comp_choice)
+    def get_computer_choice(self, predicted_move=None):
+        if predicted_move is not None:
+            return (predicted_move + 1) % 3  # Counter predicted move
+        return random.randint(0, 2)
     
-    embed.add_field(name="You played", value=f"{user_emoji} {user_move_name.title()}", inline=True)
-    embed.add_field(name="I played", value=f"{comp_emoji} {comp_move_name.title()}", inline=True)
-    embed.add_field(name="Result", value=result_text, inline=False)
-    embed.add_field(name="Visual", value=f"{user_emoji} vs {comp_emoji}", inline=False)
+    def determine_winner(self, user, comp):
+        """FIXED: Correct Rock Paper Scissors logic"""
+        if user == comp:
+            return 0  # Draw
+        # Rock(0) beats Scissors(2), Paper(1) beats Rock(0), Scissors(2) beats Paper(1)
+        elif (user == 0 and comp == 2) or (user == 1 and comp == 0) or (user == 2 and comp == 1):
+            return 1  # User wins
+        else:
+            return -1  # Computer wins
     
-    # Add ML info if used
-    if ml_used:
-        ml_status = f"🤖 ML Prediction (Confidence: {confidence:.0f}%)"
-        embed.add_field(name="AI Mode", value=ml_status, inline=False)
+    def get_move_name(self, move_int):
+        return self.moves[move_int]
     
-    return embed
+    def get_move_emoji(self, move_int):
+        return self.emojis[move_int]
 
-# Bot setup
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+class PlayerManager:
+    def __init__(self):
+        self.players = {}
+        self.predictor = MLPredictor()
+    
+    def get_player(self, user_id):
+        user_id = str(user_id)
+        if user_id not in self.players:
+            self.players[user_id] = Player(user_id)
+        return self.players[user_id]
 
 # Initialize game components
 game = RPSGame()
 player_manager = PlayerManager()
+challenge_system = ChallengeSystem()
+
+# Bot setup with proper intents
+intents = discord.Intents.default()
+intents.message_content = True
+intents.reactions = True
+bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
-    print('ML-Enhanced RPS Bot is ready to play!')
+    print('Enhanced ML RPS Bot is ready!')
 
-# Commands using the OOP classes
+def create_result_embed(user_choice, comp_choice, outcome, user_name, ml_used=False, 
+                       confidence=0, prediction_dodged=False):
+    """Create result embed"""
+    
+    if outcome == 1:
+        result_text = "🎉 You win!"
+        color = 0x00ff00
+    elif outcome == -1:
+        result_text = "😞 You lose!"
+        color = 0xff0000
+    else:
+        result_text = "🤝 It's a draw!"
+        color = 0xffff00
+    
+    embed = discord.Embed(title="🎮 RPS Battle Result", color=color)
+    
+    user_emoji = game.get_move_emoji(user_choice)
+    comp_emoji = game.get_move_emoji(comp_choice)
+    user_move = game.get_move_name(user_choice)
+    comp_move = game.get_move_name(comp_choice)
+    
+    embed.add_field(name=f"👤 {user_name}", value=f"{user_emoji} {user_move.title()}", inline=True)
+    embed.add_field(name="🤖 AI Bot", value=f"{comp_emoji} {comp_move.title()}", inline=True)
+    embed.add_field(name="Result", value=result_text, inline=False)
+    
+    # Battle visual
+    embed.add_field(name="⚔️ Battle", value=f"{user_emoji} vs {comp_emoji}", inline=False)
+    
+    # ML info
+    if ml_used:
+        ml_status = f"🧠 AI Prediction Used\nConfidence: {confidence:.1f}%"
+        if prediction_dodged:
+            ml_status += "\n🎯 You dodged the prediction!"
+        embed.add_field(name="AI Analysis", value=ml_status, inline=False)
+    
+    return embed
+
 @bot.command(name='rps')
 async def play_rps(ctx, move=None):
-    """Play Rock Paper Scissors! Usage: !rps rock/paper/scissors"""
+    """Play Rock Paper Scissors with ML prediction"""
     if move is None:
         embed = discord.Embed(
-            title="🎮 Rock Paper Scissors",
+            title="🎮 Enhanced Rock Paper Scissors",
             description="Usage: `!rps rock`, `!rps paper`, or `!rps scissors`",
-            color=0x00ff00
+            color=0x00ff99
         )
-        embed.add_field(name="How to play", value="Choose your move and I'll play against you!", inline=False)
-        embed.add_field(name="AI Learning", value="After 5 games, I'll start learning your patterns! 🤖", inline=False)
+        embed.add_field(name="🧠 AI Learning", value="I learn your patterns after 10 games!", inline=False)
+        embed.add_field(name="Commands", value="`!rpsq` - Quick play\n`!challenge @user` - PvP battle", inline=False)
         await ctx.send(embed=embed)
         return
     
-    # Process the game
+    # Validate move
     user_choice = game.get_user_choice(move)
     if user_choice is None:
-        await ctx.send("❌ Invalid choice! Please use `rock`, `paper`, or `scissors`")
+        await ctx.send("❌ Invalid! Use: rock, paper, or scissors")
         return
     
-    # Get player and check if we should use ML
+    # Get player
     player = player_manager.get_player(ctx.author.id)
     
+    # ML prediction
     ml_used = False
     confidence = 0
     predicted_move = None
+    prediction_correct = False
     
-    if player_manager.should_use_ml(player):
-        # Update ML patterns with current history
-        player_manager.predictor.update_patterns(list(player.moves_history))
-        
-        # Try to predict user's move
-        predicted_move = player_manager.predictor.predict_next_move(list(player.moves_history))
-        confidence = player_manager.predictor.get_confidence(list(player.moves_history))
-        
-        if predicted_move is not None and confidence > 30:  # Only use if confident enough
-            ml_used = True
+    if len(player.moves_history) >= 10:
+        if player_manager.predictor.train(player):
+            predicted_move, confidence = player_manager.predictor.predict(player)
+            if predicted_move is not None and confidence > 50:
+                ml_used = True
+                prediction_correct = (predicted_move == user_choice)
     
-    # Generate computer move
+    # Computer move
     comp_choice = game.get_computer_choice(predicted_move if ml_used else None)
     outcome = game.determine_winner(user_choice, comp_choice)
     
-    # Update player data
-    player.add_game_result(user_choice, outcome, ml_used)
+    # Update player
+    player.add_game_result(user_choice, outcome, ml_used, prediction_correct)
     
-    # Create result embed
-    embed = create_result_embed(user_choice, comp_choice, outcome, ml_used, confidence)
+    # Create and send result
+    prediction_dodged = ml_used and not prediction_correct
+    embed = create_result_embed(user_choice, comp_choice, outcome, ctx.author.display_name,
+                               ml_used, confidence, prediction_dodged)
     await ctx.send(embed=embed)
 
 @bot.command(name='rpsq')
 async def quick_rps(ctx):
-    """Quick RPS with reaction buttons"""
+    """Quick reaction-based RPS"""
     embed = discord.Embed(
-        title="🎮 Quick RPS",
+        title="⚡ Quick RPS Battle",
         description="React with your choice!",
-        color=0x0099ff
+        color=0xff6b00
     )
     embed.add_field(name="🪨", value="Rock", inline=True)
     embed.add_field(name="📄", value="Paper", inline=True)
@@ -302,266 +469,285 @@ async def quick_rps(ctx):
     
     message = await ctx.send(embed=embed)
     
-    # Add reaction buttons
     for emoji in ["🪨", "📄", "✂️"]:
         await message.add_reaction(emoji)
 
+@bot.command(name='challenge')
+async def challenge_player(ctx, member: discord.Member = None):
+    """Challenge another player"""
+    if member is None:
+        await ctx.send("❌ Mention a player: `!challenge @username`")
+        return
+    
+    if member.bot:
+        await ctx.send("❌ Can't challenge bots!")
+        return
+    
+    if member.id == ctx.author.id:
+        await ctx.send("❌ Can't challenge yourself!")
+        return
+    
+    # Check existing challenge
+    if challenge_system.get_challenge(ctx.channel.id):
+        await ctx.send("❌ Challenge already active in this channel!")
+        return
+    
+    # Create challenge
+    challenge_system.create_challenge(ctx.author.id, member.id, ctx.channel.id)
+    
+    embed = discord.Embed(
+        title="⚔️ RPS Challenge!",
+        description=f"{ctx.author.mention} challenges {member.mention}!",
+        color=0xff0066
+    )
+    embed.add_field(name="Rules", value="Best of 3 rounds", inline=False)
+    embed.add_field(name="Accept", value="React ✅ to accept or ❌ to decline", inline=False)
+    
+    message = await ctx.send(embed=embed)
+    await message.add_reaction("✅")
+    await message.add_reaction("❌")
+
 @bot.command(name='rpsstats')
-async def rps_stats(ctx, member: discord.Member = None):
-    """Show RPS statistics for a player"""
+async def show_stats(ctx, member: discord.Member = None):
+    """Show player statistics"""
     target = member or ctx.author
     player = player_manager.get_player(target.id)
     
     if player.games_played == 0:
-        await ctx.send(f"{target.display_name} hasn't played any games yet!")
+        await ctx.send(f"{target.display_name} hasn't played yet!")
         return
     
-    embed = discord.Embed(title=f"📊 {target.display_name}'s RPS Stats", color=0x0099ff)
-    embed.add_field(name="Games Played", value=player.games_played, inline=True)
-    embed.add_field(name="Wins", value=f"🏆 {player.wins}", inline=True)
-    embed.add_field(name="Losses", value=f"💀 {player.losses}", inline=True)
-    embed.add_field(name="Draws", value=f"🤝 {player.draws}", inline=True)
-    embed.add_field(name="Win Rate", value=f"📈 {player.win_rate:.1f}%", inline=True)
+    embed = discord.Embed(
+        title=f"📊 {target.display_name}'s Stats",
+        color=0x0099ff
+    )
     
-    # ML performance stats
+    # Basic stats
+    embed.add_field(
+        name="🎮 Games",
+        value=f"Played: {player.games_played}\n"
+              f"Wins: 🏆 {player.wins}\n"
+              f"Losses: 💀 {player.losses}\n"
+              f"Win Rate: 📈 {player.win_rate:.1f}%",
+        inline=True
+    )
+    
+    # Streaks
+    embed.add_field(
+        name="🔥 Streaks",
+        value=f"Current: {player.win_streak}\n"
+              f"Best: 🏅 {player.max_win_streak}",
+        inline=True
+    )
+    
+    # ML stats
     if player.ml_games > 0:
-        embed.add_field(name="AI Performance vs You", value=f"🤖 {player.ml_performance:.1f}%", inline=True)
+        embed.add_field(
+            name="🧠 vs AI",
+            value=f"Resistance: {player.ml_resistance:.1f}%\n"
+                  f"AI Games: {player.ml_games}\n"
+                  f"Dodges: 🎯 {player.prediction_dodges}",
+            inline=True
+        )
     
-    # Show move preferences
-    preferences = player.get_move_preferences()
-    if preferences:
-        pref_text = "\n".join([f"{move.title()}: {pct:.1f}%" 
-                              for move, pct in preferences.items()])
-        embed.add_field(name="Move Preferences", value=pref_text, inline=False)
+    # Move preferences
+    prefs = player.get_move_preferences()
+    pref_text = "\n".join([f"{move.title()}: {pct:.1f}%" for move, pct in prefs.items()])
+    embed.add_field(name="🎯 Preferences", value=pref_text, inline=True)
     
-    # Show predictability
-    if len(player.moves_history) >= 5:
-        # Simple predictability metric - how often they repeat patterns
-        patterns = []
-        moves_list = list(player.moves_history)
-        for i in range(len(moves_list) - 2):
-            patterns.append(tuple(moves_list[i:i+3]))
-        
-        if patterns:
-            pattern_counts = Counter(patterns)
-            most_common_pattern_count = pattern_counts.most_common(1)[0][1]
-            predictability = (most_common_pattern_count / len(patterns)) * 100
-            embed.add_field(name="Predictability", value=f"📈 {predictability:.1f}%", inline=True)
+    # Challenges
+    if player.challenge_wins + player.challenge_losses > 0:
+        total_chall = player.challenge_wins + player.challenge_losses
+        chall_wr = (player.challenge_wins / total_chall) * 100
+        embed.add_field(
+            name="⚔️ Challenges",
+            value=f"Won: {player.challenge_wins}\n"
+                  f"Lost: {player.challenge_losses}\n"
+                  f"Win Rate: {chall_wr:.1f}%",
+            inline=True
+        )
     
     await ctx.send(embed=embed)
 
-@bot.command(name='rpsleader')
-async def rps_leaderboard(ctx):
-    """Show RPS leaderboard"""
-    leaderboard = player_manager.get_leaderboard(min_games=3)
+# Additional commands continued...
+@bot.command(name='leaderboard')
+async def leaderboard(ctx, sort_by='wins'):
+    """Show leaderboard"""
+    qualified = [(uid, p) for uid, p in player_manager.players.items() if p.games_played >= 3]
     
-    if not leaderboard:
+    if not qualified:
         await ctx.send("No players with 3+ games yet!")
         return
     
-    embed = discord.Embed(title="🏆 RPS Leaderboard", color=0xffd700)
+    # Sort options
+    if sort_by == 'wins':
+        qualified.sort(key=lambda x: x[1].win_rate, reverse=True)
+        title = "🏆 Win Rate Leaders"
+    elif sort_by == 'games':
+        qualified.sort(key=lambda x: x[1].games_played, reverse=True)
+        title = "🎮 Most Active"
+    elif sort_by == 'resistance':
+        qualified = [(uid, p) for uid, p in qualified if p.ml_games >= 3]
+        qualified.sort(key=lambda x: x[1].ml_resistance, reverse=True)
+        title = "🧠 AI Resistance"
+    else:
+        qualified.sort(key=lambda x: x[1].win_rate, reverse=True)
+        title = "🏆 Win Rate Leaders"
     
-    for i, (user_id, player) in enumerate(leaderboard[:10]):
+    embed = discord.Embed(title=title, color=0xffd700)
+    
+    for i, (user_id, player) in enumerate(qualified[:10]):
         try:
-            # Try multiple methods to get user info
             user = bot.get_user(int(user_id))
-            if not user:
-                # Try fetching from Discord API if not in cache
-                try:
-                    user = await bot.fetch_user(int(user_id))
-                except:
-                    user = None
+            name = user.display_name if user else f"Player {user_id}"
             
-            # Get the best available name
-            if user:
-                name = user.display_name or user.name or user.global_name
+            if sort_by == 'resistance':
+                value = f"AI Resistance: {player.ml_resistance:.1f}%"
             else:
-                name = f"Player {user_id}"
+                value = f"Win Rate: {player.win_rate:.1f}% ({player.games_played} games)"
             
-            # Add ML performance if available
-            ml_info = ""
-            if player.ml_games > 0:
-                ml_info = f" | AI: {player.ml_performance:.0f}%"
-            
-            embed.add_field(
-                name=f"{i+1}. {name}",
-                value=f"Win Rate: {player.win_rate:.1f}% ({player.wins}/{player.games_played}){ml_info}",
-                inline=False
-            )
-        except Exception as e:
-            # Fallback for any errors
-            embed.add_field(
-                name=f"{i+1}. Unknown Player",
-                value=f"Win Rate: {player.win_rate:.1f}% ({player.wins}/{player.games_played})",
-                inline=False
-            )
+            embed.add_field(name=f"{i+1}. {name}", value=value, inline=False)
+        except:
             continue
     
     await ctx.send(embed=embed)
 
-@bot.command(name='rpsreset')
-async def reset_stats(ctx):
-    """Reset your RPS statistics"""
-    if player_manager.reset_player(ctx.author.id):
-        await ctx.send("🔄 Your RPS stats have been reset!")
-    else:
-        await ctx.send("You don't have any stats to reset!")
-
-@bot.command(name='rpsml')
-async def ml_info(ctx):
-    """Show ML prediction info for the user"""
-    player = player_manager.get_player(ctx.author.id)
-    
-    if len(player.moves_history) < 5:
-        await ctx.send("🤖 Play at least 5 games first, then I'll start learning your patterns!")
-        return
-    
-    embed = discord.Embed(title="🤖 AI Analysis", color=0x9932cc)
-    
-    # Update patterns and get prediction
-    player_manager.predictor.update_patterns(list(player.moves_history))
-    predicted = player_manager.predictor.predict_next_move(list(player.moves_history))
-    confidence = player_manager.predictor.get_confidence(list(player.moves_history))
-    
-    if predicted is not None:
-        predicted_name = game.get_move_name(predicted)
-        predicted_emoji = game.get_move_emoji(predicted)
-        embed.add_field(
-            name="Next Move Prediction", 
-            value=f"{predicted_emoji} {predicted_name.title()}", 
-            inline=True
-        )
-        embed.add_field(name="Confidence", value=f"{confidence:.1f}%", inline=True)
-    else:
-        embed.add_field(name="Prediction", value="No clear pattern detected", inline=False)
-    
-    # Recent moves
-    if len(player.moves_history) >= 5:
-        recent = list(player.moves_history)[-5:]
-        recent_text = " → ".join([game.get_move_emoji(m) for m in recent])
-        embed.add_field(name="Recent Moves", value=recent_text, inline=False)
-    
-    # ML vs player performance
-    if player.ml_games > 0:
-        embed.add_field(
-            name="AI vs You", 
-            value=f"AI Win Rate: {player.ml_performance:.1f}% ({player.ml_games - player.ml_wins} wins / {player.ml_games} AI games)", 
-            inline=False
-        )
-    
-    await ctx.send(embed=embed)
-
 @bot.command(name='rpshelp')
-async def rps_help(ctx):
-    """Show all available RPS commands"""
+async def show_help(ctx):
+    """Show all available commands"""
     embed = discord.Embed(
-        title="🎮 RPS Bot Commands", 
-        description="All available Rock Paper Scissors commands:",
+        title="🎮 Enhanced RPS Bot Commands",
+        description="Advanced Rock Paper Scissors with AI learning!",
         color=0x00ff99
     )
     
     embed.add_field(
-        name="!rps <move>", 
-        value="Play RPS! Use `!rps rock`, `!rps paper`, or `!rps scissors`", 
-        inline=False
-    )
-    embed.add_field(
-        name="!rpsq", 
-        value="Quick RPS with reaction buttons - just click to play!", 
-        inline=False
-    )
-    embed.add_field(
-        name="!rpsstats [@user]", 
-        value="View your stats or another player's stats", 
-        inline=False
-    )
-    embed.add_field(
-        name="!rpsleader", 
-        value="View the leaderboard (players with 3+ games)", 
-        inline=False
-    )
-    embed.add_field(
-        name="!rpsml", 
-        value="🤖 View AI analysis of your play patterns (after 5+ games)", 
-        inline=False
-    )
-    embed.add_field(
-        name="!rpsreset", 
-        value="Reset your personal statistics", 
-        inline=False
-    )
-    embed.add_field(
-        name="!rpshelp", 
-        value="Show this help message", 
+        name="🎯 Game Commands",
+        value="`!rps <move>` - Play RPS with AI\n"
+              "`!rpsq` - Quick reaction game\n"
+              "`!challenge @user` - Challenge a player",
         inline=False
     )
     
     embed.add_field(
-        name="🤖 AI Features", 
-        value="After 5 games, the bot learns your patterns and tries to predict your moves!", 
+        name="📊 Stats Commands",
+        value="`!rpsstats [@user]` - View detailed stats\n"
+              "`!leaderboard [wins/games/resistance]` - Rankings\n"
+              "`!mlinfo` - AI prediction analysis",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🧠 AI Features",
+        value="• Learns patterns after 10 games\n"
+              "• Multiple ML models\n"
+              "• Real-time confidence display\n"
+              "• Pattern dodge detection",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⚔️ Challenge System",
+        value="• Best of 3 rounds\n"
+              "• Separate challenge statistics\n"
+              "• Real-time move submission\n"
+              "• Challenge leaderboards",
         inline=False
     )
     
     await ctx.send(embed=embed)
 
+# Background cleanup task
+async def cleanup_task():
+    """Periodic cleanup of old challenges"""
+    while True:
+        await asyncio.sleep(60)  # Every minute
+        try:
+            current_time = time.time()
+            expired = []
+            for channel_id, challenge in challenge_system.challenges.items():
+                if current_time - challenge['timestamp'] > 300:  # 5 minutes
+                    expired.append(channel_id)
+            
+            for channel_id in expired:
+                del challenge_system.challenges[channel_id]
+            
+            if expired:
+                print(f"Cleaned up {len(expired)} expired challenges")
+        except Exception as e:
+            print(f"Cleanup error: {e}")
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Handle command errors gracefully"""
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("❌ Missing argument! Use `!rpshelp` for usage info.")
+    elif isinstance(error, commands.CommandNotFound):
+        pass  # Ignore unknown commands
+    else:
+        print(f"Command error: {error}")
+        await ctx.send("An error occurred processing that command.")
+
+# Simple test command to verify bot is working
+@bot.command(name='test')
+async def test_command(ctx):
+    """Test if bot is responding"""
+    await ctx.send("Bot is working! ✅")
+
 @bot.event
 async def on_reaction_add(reaction, user):
-    """Handle reaction-based gameplay"""
+    """Handle reaction-based quick RPS gameplay"""
     if user.bot:
         return
-    
-    if (reaction.message.embeds and 
-        len(reaction.message.embeds) > 0 and 
-        "Quick RPS" in reaction.message.embeds[0].title):
-        
-        reaction_map = {"🪨": "rock", "📄": "paper", "✂️": "scissors"}
-        
-        if str(reaction.emoji) in reaction_map:
-            move = reaction_map[str(reaction.emoji)]
-            user_choice = game.get_user_choice(move)
-            
-            # Get player and check ML
-            player = player_manager.get_player(user.id)
-            
-            ml_used = False
-            confidence = 0
-            predicted_move = None
-            
-            if player_manager.should_use_ml(player):
-                player_manager.predictor.update_patterns(list(player.moves_history))
-                predicted_move = player_manager.predictor.predict_next_move(list(player.moves_history))
-                confidence = player_manager.predictor.get_confidence(list(player.moves_history))
-                
-                if predicted_move is not None and confidence > 30:
-                    ml_used = True
-            
-            comp_choice = game.get_computer_choice(predicted_move if ml_used else None)
-            outcome = game.determine_winner(user_choice, comp_choice)
-            
-            # Update player data
-            player.add_game_result(user_choice, outcome, ml_used)
-            
-            # Send result
-            embed = create_result_embed(user_choice, comp_choice, outcome, ml_used, confidence)
-            await reaction.message.channel.send(f"{user.mention}", embed=embed)
-ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(dotenv_path=ENV_PATH)
+    # Check if the message is a quick RPS embed
+    if reaction.message.author != bot.user:
+        return
+    if not reaction.message.embeds:
+        return
+    embed = reaction.message.embeds[0]
+    if embed.title != "⚡ Quick RPS Battle":
+        return
+    # Map emoji to move
+    emoji_to_move = {"🪨": "rock", "📄": "paper", "✂️": "scissors"}
+    move = emoji_to_move.get(str(reaction.emoji))
+    if move is None:
+        return
+    user_choice = game.get_user_choice(move)
+    player = player_manager.get_player(user.id)
+    ml_used = False
+    confidence = 0
+    predicted_move = None
+    prediction_correct = False
+    if len(player.moves_history) >= 10:
+        if player_manager.predictor.train(player):
+            predicted_move, confidence = player_manager.predictor.predict(player)
+            if predicted_move is not None and confidence > 50:
+                ml_used = True
+                prediction_correct = (predicted_move == user_choice)
+    comp_choice = game.get_computer_choice(predicted_move if ml_used else None)
+    outcome = game.determine_winner(user_choice, comp_choice)
+    player.add_game_result(user_choice, outcome, ml_used, prediction_correct)
+    prediction_dodged = ml_used and not prediction_correct
+    result_embed = create_result_embed(user_choice, comp_choice, outcome, user.display_name,
+                                      ml_used, confidence, prediction_dodged)
+    await reaction.message.channel.send(f"{user.mention}", embed=result_embed)
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 # Run the bot
-if __name__ == "__main__":
-    token = os.getenv("DISCORD_BOT_TOKEN")
-    token = token.strip() if token else None  # strip hidden whitespace/newlines
-
-    # quick sanity check w/o printing the token
-    if not token:
-        print("❌ DISCORD_BOT_TOKEN is missing. Check your .env location/content.")
-        raise SystemExit(1)
-    if " " in token or token.startswith('"') or token.endswith('"'):
-        print("❌ Token has quotes/spaces. Remove them in .env.")
-        raise SystemExit(1)
-
+if __name__ == '__main__':
+    # Get token from environment variable
+    BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+    
+    if not BOT_TOKEN:
+        print("❌ Please set the DISCORD_BOT_TOKEN environment variable!")
+        print("Create a .env file with: DISCORD_BOT_TOKEN=your_token_here")
+        exit(1)
+    
     try:
-        bot.run(token)   # do NOT prefix with "Bot "
+        print("Starting bot...")
+        bot.run(BOT_TOKEN)
+    except discord.errors.LoginFailure:
+        print("❌ Invalid bot token! Please check your DISCORD_BOT_TOKEN.")
     except Exception as e:
         print(f"❌ Bot failed to start: {e}")
-        print("If this says 'Improper token', regenerate the Bot Token and paste it again.")
